@@ -8,6 +8,7 @@
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict
+import asyncio
 import tomllib
 
 from app.core.logger import logger
@@ -220,7 +221,22 @@ class Config:
             self._ensure_defaults()
 
             storage = get_storage()
-            config_data = await storage.load_config()
+
+            # 带重试的远程加载（应对 Neon 等云数据库冷启动延迟）
+            config_data = None
+            max_retries = 3
+            for attempt in range(max_retries):
+                config_data = await storage.load_config()
+                if config_data is not None:
+                    break
+                if attempt < max_retries - 1:
+                    wait = (attempt + 1) * 1.0  # 1s, 2s
+                    logger.warning(
+                        f"Remote storage unreachable (attempt {attempt + 1}/{max_retries}), "
+                        f"retrying in {wait}s..."
+                    )
+                    await asyncio.sleep(wait)
+
             remote_ok = config_data is not None  # None 表示远程存储不可达
 
             # 远程存储不可达时，尝试从本地初始化

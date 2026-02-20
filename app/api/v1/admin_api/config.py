@@ -4,7 +4,12 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from app.core.auth import verify_app_key
 from app.core.config import config
-from app.core.storage import get_storage, LocalStorage, RedisStorage, SQLStorage
+from app.core.storage import (
+    get_storage as _get_storage,
+    LocalStorage,
+    RedisStorage,
+    SQLStorage,
+)
 
 router = APIRouter()
 
@@ -12,7 +17,7 @@ router = APIRouter()
 @router.get("/health")
 async def health_check():
     """数据库连接诊断（无需认证，部署后可删除）"""
-    storage = get_storage()
+    storage = _get_storage()
     result = {
         "storage_type": os.getenv("SERVER_STORAGE_TYPE", "local"),
         "storage_class": storage.__class__.__name__,
@@ -72,11 +77,11 @@ async def update_config(data: dict):
 
 
 @router.get("/storage", dependencies=[Depends(verify_app_key)])
-async def get_storage():
+async def get_storage_type():
     """获取当前存储模式"""
     storage_type = os.getenv("SERVER_STORAGE_TYPE", "").lower()
     if not storage_type:
-        storage = get_storage()
+        storage = _get_storage()
         if isinstance(storage, LocalStorage):
             storage_type = "local"
         elif isinstance(storage, RedisStorage):

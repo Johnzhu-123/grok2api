@@ -76,7 +76,21 @@ class TokenManager:
         if not self.initialized:
             try:
                 storage = get_storage()
-                data = await storage.load_tokens()
+
+                # 带重试的远程加载（应对云数据库冷启动延迟）
+                data = None
+                max_retries = 3
+                for attempt in range(max_retries):
+                    data = await storage.load_tokens()
+                    if data is not None:
+                        break
+                    if attempt < max_retries - 1:
+                        wait = (attempt + 1) * 1.0
+                        logger.warning(
+                            f"Remote token storage unreachable (attempt {attempt + 1}/{max_retries}), "
+                            f"retrying in {wait}s..."
+                        )
+                        await asyncio.sleep(wait)
 
                 # None 表示远程存储不可达（连接错误），{} 表示表为空
                 remote_ok = data is not None
