@@ -619,6 +619,20 @@ class SQLStorage(BaseStorage):
             async with self.engine.begin() as conn:
                 from sqlalchemy import text
 
+                # 先快速检测表是否已存在，避免并发 DDL 导致死锁
+                if self.dialect in ("postgres", "postgresql", "pgsql"):
+                    res = await conn.execute(
+                        text(
+                            "SELECT COUNT(*) FROM information_schema.tables "
+                            "WHERE table_name IN ('tokens', 'app_config')"
+                        )
+                    )
+                    table_count = res.scalar()
+                    if table_count == 2:
+                        # 两张表都存在，跳过 DDL 操作
+                        self._initialized = True
+                        return
+
                 # Tokens 表 (通用 SQL)
                 await conn.execute(
                     text("""
@@ -730,6 +744,15 @@ class SQLStorage(BaseStorage):
             self._initialized = True
         except Exception as e:
             logger.error(f"SQLStorage: Schema 初始化失败: {e}")
+            # 如果是死锁或并发 DDL 错误，假设另一个实例已完成初始化
+            err_msg = str(e).lower()
+            if "deadlock" in err_msg or "already exists" in err_msg:
+                logger.info(
+                    "Schema init conflict (likely concurrent startup), "
+                    "assuming schema is ready."
+                )
+                self._initialized = True
+                return
             raise
 
     def _normalize_status(self, status: Any) -> Any:
