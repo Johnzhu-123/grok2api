@@ -9,6 +9,45 @@ from app.core.storage import get_storage, LocalStorage, RedisStorage, SQLStorage
 router = APIRouter()
 
 
+@router.get("/health")
+async def health_check():
+    """数据库连接诊断（无需认证，部署后可删除）"""
+    storage = get_storage()
+    result = {
+        "storage_type": os.getenv("SERVER_STORAGE_TYPE", "local"),
+        "storage_class": storage.__class__.__name__,
+        "config_loaded": bool(config._config),
+        "app_key_source": "unknown",
+    }
+
+    # 检查配置是否从数据库加载
+    app_key = config.get("app.app_key")
+    if app_key and app_key != "grok2api":
+        result["app_key_source"] = "database (custom password found)"
+    elif app_key == "grok2api":
+        result["app_key_source"] = "default (may be from DB or fallback)"
+    else:
+        result["app_key_source"] = "missing"
+
+    # 测试数据库连接
+    if isinstance(storage, SQLStorage):
+        try:
+            data = await storage.load_config()
+            if data is None:
+                result["db_connection"] = "FAILED (returned None)"
+            else:
+                result["db_connection"] = "OK"
+                result["db_config_count"] = len(
+                    [k for section in data.values() if isinstance(section, dict) for k in section]
+                )
+        except Exception as e:
+            result["db_connection"] = f"ERROR: {e}"
+    else:
+        result["db_connection"] = "N/A (not SQL storage)"
+
+    return result
+
+
 @router.get("/verify", dependencies=[Depends(verify_app_key)])
 async def admin_verify():
     """验证后台访问密钥（app_key）"""
