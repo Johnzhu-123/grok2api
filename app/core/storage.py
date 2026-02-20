@@ -570,6 +570,35 @@ class SQLStorage(BaseStorage):
         max_overflow = 1 if is_serverless else 10
         pool_recycle = 300 if is_serverless else 3600
 
+        # asyncpg 连接参数
+        connect_args = {}
+        is_asyncpg = "+asyncpg" in url
+        if is_asyncpg:
+            import ssl as ssl_module
+
+            # 为 asyncpg 创建 SSL 上下文（Neon 等云数据库要求 SSL）
+            # asyncpg 不识别 URL 中的 sslmode 参数，需要通过 connect_args 传递
+            ssl_ctx = ssl_module.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl_module.CERT_NONE
+            connect_args["ssl"] = ssl_ctx
+
+            # 清理 URL 中 asyncpg 不支持的参数
+            if "?" in url:
+                base_url, query = url.split("?", 1)
+                import urllib.parse
+
+                params = urllib.parse.parse_qs(query)
+                # 移除 asyncpg 不支持的参数
+                unsupported = {"sslmode", "ssl"}
+                cleaned = {
+                    k: v[0] for k, v in params.items() if k not in unsupported
+                }
+                if cleaned:
+                    url = base_url + "?" + urllib.parse.urlencode(cleaned)
+                else:
+                    url = base_url
+
         self.engine = create_async_engine(
             url,
             echo=False,
@@ -577,6 +606,7 @@ class SQLStorage(BaseStorage):
             max_overflow=max_overflow,
             pool_recycle=pool_recycle,
             pool_pre_ping=True,
+            connect_args=connect_args,
         )
         self.async_session = async_sessionmaker(self.engine, expire_on_commit=False)
         self._initialized = False
