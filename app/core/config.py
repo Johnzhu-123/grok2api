@@ -221,15 +221,22 @@ class Config:
 
             storage = get_storage()
             config_data = await storage.load_config()
-            from_remote = True
+            remote_ok = config_data is not None  # None 表示远程存储不可达
 
-            # 从本地 data/config.toml 初始化后端
-            if config_data is None:
+            # 远程存储不可达时，尝试从本地初始化
+            local_has_data = False
+            if not remote_ok:
+                logger.warning(
+                    "Remote storage unreachable, trying local config fallback..."
+                )
                 local_storage = LocalStorage()
-                from_remote = False
                 try:
-                    # 尝试读取本地配置
-                    config_data = await local_storage.load_config()
+                    local_data = await local_storage.load_config()
+                    if local_data:
+                        config_data = local_data
+                        local_has_data = True
+                    else:
+                        config_data = {}
                 except Exception as e:
                     logger.info(f"Failed to auto-init config from local: {e}")
                     config_data = {}
@@ -248,20 +255,38 @@ class Config:
 
             merged = _deep_merge(self._defaults, config_data)
 
-            # 自动回填缺失配置到存储
-            # 或迁移了配置后需要更新
-            should_persist = (
-                (not from_remote) or (merged != config_data) or deprecated_sections
-            )
+            # 判断是否需要回写到远程存储
+            # 关键安全逻辑：仅在以下情况回写
+            # 1. 远程可达且有本地数据需要初始化远程（首次部署迁移）
+            # 2. 远程可达且配置有变化（默认值回填或配置迁移）
+            # 绝不在远程不可达时回写，避免用默认值覆盖用户数据
+            should_persist = False
+            if remote_ok and local_has_data:
+                # 远程可达但为空，本地有数据 → 初始化远程存储
+                should_persist = True
+            elif remote_ok and (merged != config_data or deprecated_sections):
+                # 远程可达且配置需要更新（回填缺失默认值或迁移）
+                should_persist = True
+
             if should_persist:
-                async with storage.acquire_lock("config_save", timeout=10):
-                    await storage.save_config(merged)
-                if not from_remote:
-                    logger.info(
-                        f"Initialized remote storage ({storage.__class__.__name__}) with config baseline."
-                    )
-                if deprecated_sections:
-                    logger.info("Configuration automatically migrated and cleaned.")
+                try:
+                    async with storage.acquire_lock("config_save", timeout=10):
+                        await storage.save_config(merged)
+                    if local_has_data:
+                        logger.info(
+                            f"Initialized remote storage ({storage.__class__.__name__}) with config baseline."
+                        )
+                    if deprecated_sections:
+                        logger.info("Configuration automatically migrated and cleaned.")
+                except Exception as e:
+                    logger.error(f"Failed to persist config update: {e}")
+                    # 回写失败不影响当前实例运行
+
+            if not remote_ok and not local_has_data:
+                logger.warning(
+                    "Remote storage unreachable and no local config found. "
+                    "Running with defaults (changes will NOT be persisted)."
+                )
 
             self._config = merged
         except Exception as e:

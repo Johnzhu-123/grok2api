@@ -342,7 +342,7 @@ class RedisStorage(BaseStorage):
         try:
             raw_data = await self.redis.hgetall(self.config_key)
             if not raw_data:
-                return None
+                return {}  # 空数据：首次启动，返回空字典而非 None
 
             config = {}
             for composite_key, val_str in raw_data.items():
@@ -361,7 +361,7 @@ class RedisStorage(BaseStorage):
             return config
         except Exception as e:
             logger.error(f"RedisStorage: 加载配置失败: {e}")
-            return None
+            return None  # 连接错误：返回 None 表示不可达
 
     async def save_config(self, data: Dict[str, Any]):
         """保存配置到 Redis Hash"""
@@ -386,7 +386,7 @@ class RedisStorage(BaseStorage):
         try:
             pool_names = await self.redis.smembers(self.key_pools)
             if not pool_names:
-                return None
+                return {}  # 空数据：返回空字典而非 None
 
             pools = {}
             async with self.redis.pipeline() as pipe:
@@ -562,13 +562,20 @@ class SQLStorage(BaseStorage):
 
         self.dialect = url.split(":", 1)[0].split("+", 1)[0].lower()
 
-        # 配置 robust 的连接池
+        # 连接池配置
+        # 无服务器环境 (Vercel/Lambda) 会频繁创建新实例，每个实例都有独立连接池
+        # 使用较小的池大小避免耗尽数据库连接数限制
+        is_serverless = os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+        pool_size = 2 if is_serverless else 20
+        max_overflow = 1 if is_serverless else 10
+        pool_recycle = 300 if is_serverless else 3600
+
         self.engine = create_async_engine(
             url,
             echo=False,
-            pool_size=20,
-            max_overflow=10,
-            pool_recycle=3600,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_recycle=pool_recycle,
             pool_pre_ping=True,
         )
         self.async_session = async_sessionmaker(self.engine, expire_on_commit=False)
@@ -908,7 +915,7 @@ class SQLStorage(BaseStorage):
                 )
                 rows = res.fetchall()
                 if not rows:
-                    return None
+                    return {}  # 空表：首次启动，返回空字典而非 None
 
                 config = {}
                 for section, key, val_str in rows:
@@ -922,7 +929,7 @@ class SQLStorage(BaseStorage):
                 return config
         except Exception as e:
             logger.error(f"SQLStorage: 加载配置失败: {e}")
-            return None
+            return None  # 连接错误：返回 None 表示不可达
 
     async def save_config(self, data: Dict[str, Any]):
         await self._ensure_schema()
@@ -930,8 +937,6 @@ class SQLStorage(BaseStorage):
 
         try:
             async with self.async_session() as session:
-                await session.execute(text("DELETE FROM app_config"))
-
                 params = []
                 for section, items in data.items():
                     if not isinstance(items, dict):
@@ -945,13 +950,47 @@ class SQLStorage(BaseStorage):
                             }
                         )
 
-                if params:
-                    await session.execute(
-                        text(
-                            "INSERT INTO app_config (section, key_name, value) VALUES (:s, :k, :v)"
-                        ),
-                        params,
+                # 收集本次要写入的所有 (section, key_name) 组合
+                new_keys = {(p["s"], p["k"]) for p in params}
+
+                # 先删除不再存在的旧配置项（而非全部删除）
+                if new_keys:
+                    existing_res = await session.execute(
+                        text("SELECT section, key_name FROM app_config")
                     )
+                    existing_keys = {(r[0], r[1]) for r in existing_res.fetchall()}
+                    stale_keys = existing_keys - new_keys
+                    for s, k in stale_keys:
+                        await session.execute(
+                            text(
+                                "DELETE FROM app_config WHERE section = :s AND key_name = :k"
+                            ),
+                            {"s": s, "k": k},
+                        )
+                else:
+                    await session.execute(text("DELETE FROM app_config"))
+
+                # 使用 UPSERT 保证原子性
+                if params:
+                    if self.dialect in ("postgres", "postgresql", "pgsql"):
+                        upsert_stmt = text(
+                            "INSERT INTO app_config (section, key_name, value) "
+                            "VALUES (:s, :k, :v) "
+                            "ON CONFLICT (section, key_name) DO UPDATE SET value = EXCLUDED.value"
+                        )
+                    elif self.dialect in ("mysql", "mariadb"):
+                        upsert_stmt = text(
+                            "INSERT INTO app_config (section, key_name, value) "
+                            "VALUES (:s, :k, :v) "
+                            "ON DUPLICATE KEY UPDATE value = VALUES(value)"
+                        )
+                    else:
+                        # SQLite 等其他数据库回退到 INSERT OR REPLACE
+                        upsert_stmt = text(
+                            "INSERT OR REPLACE INTO app_config (section, key_name, value) "
+                            "VALUES (:s, :k, :v)"
+                        )
+                    await session.execute(upsert_stmt, params)
                 await session.commit()
         except Exception as e:
             logger.error(f"SQLStorage: 保存配置失败: {e}")
@@ -974,7 +1013,7 @@ class SQLStorage(BaseStorage):
                 )
                 rows = res.fetchall()
                 if not rows:
-                    return None
+                    return {}  # 空表：首次启动，返回空字典而非 None
 
                 pools = {}
                 for (

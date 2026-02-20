@@ -78,8 +78,29 @@ class TokenManager:
                 storage = get_storage()
                 data = await storage.load_tokens()
 
-                # 如果后端返回 None 或空数据，尝试从本地 data/token.json 初始化后端
-                if not data:
+                # None 表示远程存储不可达（连接错误），{} 表示表为空
+                remote_ok = data is not None
+
+                if not remote_ok:
+                    # 远程存储不可达，尝试从本地加载但不回写到远程
+                    logger.warning(
+                        "Remote token storage unreachable, trying local fallback..."
+                    )
+                    local_storage = LocalStorage()
+                    local_data = await local_storage.load_tokens()
+                    if local_data:
+                        data = local_data
+                        logger.info(
+                            "Loaded tokens from local storage (read-only fallback)."
+                        )
+                    else:
+                        data = {}
+                        logger.warning(
+                            "Remote storage unreachable and no local tokens found. "
+                            "Token pool is empty for this instance."
+                        )
+                elif not data:
+                    # 远程可达但表为空，尝试从本地初始化远程
                     local_storage = LocalStorage()
                     local_data = await local_storage.load_tokens()
                     if local_data:
