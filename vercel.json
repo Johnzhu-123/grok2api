@@ -3,7 +3,7 @@
   "version": 2,
   "framework": "fastapi",
   "functions": {
-    "api/**": {
+    "main.py": {
       "maxDuration": 60
     }
   },
