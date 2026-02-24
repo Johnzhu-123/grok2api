@@ -2,21 +2,21 @@
 Asset proxy API route.
 
 Streams assets from assets.grok.com in real-time, using HMAC-signed URLs
-to prevent unauthorized access. Uses aiohttp (pure Python) instead of
-curl_cffi to ensure compatibility with serverless platforms like Vercel.
+to prevent unauthorized access. Uses curl_cffi with browser TLS fingerprint
+impersonation to bypass Cloudflare detection.
 """
 
 import hashlib
 import hmac
 import time
 
-import aiohttp
+from curl_cffi.requests import AsyncSession
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from app.core.config import get_config
 from app.core.logger import logger
-from app.services.reverse.utils.headers import build_sso_cookie
+from app.services.reverse.utils.headers import build_headers
 from app.services.token import get_token_manager
 
 router = APIRouter(tags=["AssetProxy"])
@@ -70,29 +70,6 @@ async def _get_any_token() -> str:
     raise HTTPException(status_code=503, detail="No available tokens for asset proxy")
 
 
-def _build_asset_headers(token: str) -> dict:
-    """Build minimal headers for assets.grok.com download."""
-    user_agent = get_config("proxy.user_agent") or (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    )
-    return {
-        "Cookie": build_sso_cookie(token),
-        "User-Agent": user_agent,
-        "Accept": "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Referer": "https://grok.com/",
-        "Origin": "https://grok.com",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-site",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-
-
 @router.get("/{media_type}/{path:path}")
 async def proxy_asset(
     media_type: str,
@@ -102,7 +79,7 @@ async def proxy_asset(
 ):
     """
     Real-time asset proxy. Streams content from assets.grok.com
-    using aiohttp with SSO cookie auth. URL must be HMAC-signed.
+    using curl_cffi with browser TLS impersonation + SSO cookie.
     """
     if media_type not in ("video", "image"):
         raise HTTPException(status_code=400, detail="Invalid media type")
@@ -113,40 +90,65 @@ async def proxy_asset(
     asset_path = f"/{path}" if not path.startswith("/") else path
     token = await _get_any_token()
     url = f"{ASSETS_BASE}{asset_path}"
-    headers = _build_asset_headers(token)
 
-    # Determine proxy for outbound request
-    proxy_url = get_config("proxy.asset_proxy_url") or get_config("proxy.base_proxy_url")
+    # Build headers using the same builder as other reverse endpoints
+    headers = build_headers(
+        cookie_token=token,
+        content_type=None,
+        origin="https://assets.grok.com",
+        referer="https://grok.com/",
+    )
+    headers["Cache-Control"] = "no-cache"
+    headers["Pragma"] = "no-cache"
+    headers["Sec-Fetch-Mode"] = "navigate"
+    headers["Sec-Fetch-User"] = "?1"
+    headers["Upgrade-Insecure-Requests"] = "1"
 
-    timeout = aiohttp.ClientTimeout(total=120)
-    session = aiohttp.ClientSession(timeout=timeout)
+    # Proxy config
+    base_proxy = get_config("proxy.base_proxy_url")
+    asset_proxy = get_config("proxy.asset_proxy_url")
+    proxy = asset_proxy or base_proxy
+    proxies = {"http": proxy, "https": proxy} if proxy else None
 
+    # Browser impersonation
+    browser = get_config("proxy.browser")
+    timeout = get_config("asset.download_timeout") or 120
+
+    session = AsyncSession()
     try:
-        resp = await session.get(url, headers=headers, proxy=proxy_url or None)
+        resp = await session.get(
+            url,
+            headers=headers,
+            proxies=proxies,
+            timeout=timeout,
+            allow_redirects=True,
+            impersonate=browser,
+            stream=True,
+        )
     except Exception as e:
         await session.close()
-        logger.error(f"Asset proxy aiohttp request failed: {e}")
+        logger.error(f"Asset proxy curl_cffi request failed: {e}")
         raise HTTPException(status_code=502, detail=f"Upstream connection failed: {e}")
 
-    if resp.status != 200:
-        body = await resp.text()
-        await resp.release()
+    if resp.status_code != 200:
         await session.close()
-        logger.error(f"Asset proxy upstream returned {resp.status}: {body[:200]}")
+        logger.error(f"Asset proxy upstream returned {resp.status_code}")
         raise HTTPException(
-            status_code=resp.status,
-            detail=f"Upstream returned {resp.status}",
+            status_code=resp.status_code,
+            detail=f"Upstream returned {resp.status_code}",
         )
 
     content_type = resp.headers.get("content-type", "application/octet-stream")
 
     async def stream_response():
         try:
-            async for chunk in resp.content.iter_chunked(64 * 1024):
-                if chunk:
-                    yield chunk
+            if hasattr(resp, "aiter_content"):
+                async for chunk in resp.aiter_content():
+                    if chunk:
+                        yield chunk
+            else:
+                yield resp.content
         finally:
-            await resp.release()
             await session.close()
 
     return StreamingResponse(
