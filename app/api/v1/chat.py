@@ -627,15 +627,8 @@ async def chat_completions(request: ChatCompletionRequest):
             response_format=response_format,
             size=size,
             aspect_ratio=aspect_ratio,
-            stream=bool(is_stream),
+            stream=False,  # 强制非流式,避免客户端无法解析image_generation事件
         )
-
-        if result.stream:
-            return StreamingResponse(
-                result.data,
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-            )
 
         data = [{response_field: img} for img in result.data]
         usage = result.usage_override or {
