@@ -681,7 +681,7 @@ async def chat_completions(request: ChatCompletionRequest):
         result = await VideoService.completions(
             model=request.model,
             messages=[msg.model_dump() for msg in request.messages],
-            stream=request.stream,
+            stream=False,  # 强制非流式,避免客户端无法正确显示视频内容
             reasoning_effort=request.reasoning_effort,
             aspect_ratio=v_conf.aspect_ratio,
             video_length=v_conf.video_length,
