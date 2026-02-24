@@ -70,7 +70,7 @@ class DownloadService:
         # This avoids the need for local file caching (works on Vercel).
         from app.api.v1.asset_proxy import sign_asset_url
         clean_path = path.lstrip("/")
-        qs = sign_asset_url(clean_path, media_type)
+        qs = sign_asset_url(clean_path, media_type, token)
 
         app_url = get_config("app.app_url")
         if app_url:

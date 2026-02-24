@@ -4,8 +4,12 @@ Asset proxy API route.
 Streams assets from assets.grok.com in real-time, using HMAC-signed URLs
 to prevent unauthorized access. Uses curl_cffi with browser TLS fingerprint
 impersonation to bypass Cloudflare detection.
+
+The original SSO token is encrypted and embedded in the proxy URL so the
+same authenticated token is reused for the upstream download.
 """
 
+import base64
 import hashlib
 import hmac
 import time
@@ -33,19 +37,43 @@ def _get_signing_key() -> str:
     return key
 
 
-def sign_asset_url(path: str, media_type: str = "video") -> str:
-    """Generate a signed proxy URL path.
+def _derive_enc_key(signing_key: str) -> bytes:
+    """Derive a 32-byte encryption key from the signing key."""
+    return hashlib.sha256(f"enc:{signing_key}".encode()).digest()
 
-    Returns the query string portion: sig=...&ts=...
+
+def _xor_bytes(data: bytes, key: bytes) -> bytes:
+    """XOR data with repeating key."""
+    return bytes(d ^ key[i % len(key)] for i, d in enumerate(data))
+
+def encrypt_token(token: str) -> str:
+    """Encrypt token for embedding in URL."""
+    enc_key = _derive_enc_key(_get_signing_key())
+    encrypted = _xor_bytes(token.encode(), enc_key)
+    return base64.urlsafe_b64encode(encrypted).decode()
+
+
+def decrypt_token(encrypted: str) -> str:
+    """Decrypt token from URL parameter."""
+    enc_key = _derive_enc_key(_get_signing_key())
+    data = base64.urlsafe_b64decode(encrypted)
+    return _xor_bytes(data, enc_key).decode()
+
+
+def sign_asset_url(path: str, media_type: str = "video", token: str = "") -> str:
+    """Generate a signed proxy URL query string.
+
+    Returns: sig=...&ts=...&tk=... (tk is the encrypted token)
     """
     ts = str(int(time.time()))
     key = _get_signing_key()
-    payload = f"{media_type}:{path}:{ts}"
+    tk = encrypt_token(token) if token else ""
+    payload = f"{media_type}:{path}:{ts}:{tk}"
     sig = hmac.new(key.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
-    return f"sig={sig}&ts={ts}"
+    return f"sig={sig}&ts={ts}&tk={tk}"
 
 
-def verify_signature(path: str, media_type: str, sig: str, ts: str) -> bool:
+def verify_signature(path: str, media_type: str, sig: str, ts: str, tk: str) -> bool:
     """Verify the HMAC signature."""
     try:
         timestamp = int(ts)
@@ -54,13 +82,13 @@ def verify_signature(path: str, media_type: str, sig: str, ts: str) -> bool:
     if abs(time.time() - timestamp) > _SIG_TTL:
         return False
     key = _get_signing_key()
-    payload = f"{media_type}:{path}:{ts}"
+    payload = f"{media_type}:{path}:{ts}:{tk}"
     expected = hmac.new(key.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
     return hmac.compare_digest(sig, expected)
 
 
 async def _get_any_token() -> str:
-    """Get any available token from the pool for asset download."""
+    """Fallback: get any available token from the pool."""
     token_mgr = await get_token_manager()
     await token_mgr.reload_if_stale()
     for pool_name in list(token_mgr.pools.keys()):
@@ -69,26 +97,38 @@ async def _get_any_token() -> str:
             return token
     raise HTTPException(status_code=503, detail="No available tokens for asset proxy")
 
-
 @router.get("/{media_type}/{path:path}")
 async def proxy_asset(
     media_type: str,
     path: str,
     sig: str = Query(...),
     ts: str = Query(...),
+    tk: str = Query(""),
 ):
     """
     Real-time asset proxy. Streams content from assets.grok.com
     using curl_cffi with browser TLS impersonation + SSO cookie.
+    Token is passed encrypted in the URL to ensure the same
+    authenticated session is used.
     """
     if media_type not in ("video", "image"):
         raise HTTPException(status_code=400, detail="Invalid media type")
 
-    if not verify_signature(path, media_type, sig, ts):
+    if not verify_signature(path, media_type, sig, ts, tk):
         raise HTTPException(status_code=403, detail="Invalid or expired signature")
 
     asset_path = f"/{path}" if not path.startswith("/") else path
-    token = await _get_any_token()
+
+    # Decrypt embedded token, fall back to pool token
+    token = None
+    if tk:
+        try:
+            token = decrypt_token(tk)
+        except Exception:
+            logger.warning("Failed to decrypt embedded token, falling back to pool")
+    if not token:
+        token = await _get_any_token()
+
     url = f"{ASSETS_BASE}{asset_path}"
 
     # Build headers using the same builder as other reverse endpoints
@@ -127,7 +167,7 @@ async def proxy_asset(
         )
     except Exception as e:
         await session.close()
-        logger.error(f"Asset proxy curl_cffi request failed: {e}")
+        logger.error(f"Asset proxy request failed: {e}")
         raise HTTPException(status_code=502, detail=f"Upstream connection failed: {e}")
 
     if resp.status_code != 200:
