@@ -66,11 +66,19 @@ class DownloadService:
             path = path_or_url
             asset_url = f"https://assets.grok.com{path_or_url}"
 
+        # Build a signed proxy URL that streams from assets.grok.com in real-time.
+        # This avoids the need for local file caching (works on Vercel).
+        from app.api.v1.asset_proxy import sign_asset_url
+        clean_path = path.lstrip("/")
+        qs = sign_asset_url(clean_path, media_type)
+
         app_url = get_config("app.app_url")
         if app_url:
-            await self.download_file(asset_url, token, media_type)
-            return f"{app_url.rstrip('/')}/v1/files/{media_type}{path}"
-        return asset_url
+            # Absolute URL using configured app_url
+            return f"{app_url.rstrip('/')}/v1/proxy/{media_type}/{clean_path}?{qs}"
+
+        # Relative URL (works when client connects to the same server)
+        return f"/v1/proxy/{media_type}/{clean_path}?{qs}"
 
     async def render_image(
         self, url: str, token: str, image_id: str = "image"
