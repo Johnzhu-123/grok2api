@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 import base64
 import binascii
 import time
+import uuid
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -637,11 +638,39 @@ async def chat_completions(request: ChatCompletionRequest):
             "output_tokens": 0,
             "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
         }
+
+        # 通过chat completions端点调用时,将图片包装为标准chat completion格式
+        # 使Cherry Studio等客户端能正确识别并显示图片
+        image_parts = []
+        for item in data:
+            img_data = item.get("b64_json") or item.get("base64") or ""
+            if img_data:
+                image_parts.append(f"![image](data:image/jpeg;base64,{img_data})")
+            elif item.get("url"):
+                image_parts.append(f"![image]({item['url']})")
+        content = "\n".join(image_parts) if image_parts else ""
+
         return JSONResponse(
             content={
+                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                "object": "chat.completion",
                 "created": int(time.time()),
-                "data": data,
-                "usage": usage,
+                "model": request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": content,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
             }
         )
 
